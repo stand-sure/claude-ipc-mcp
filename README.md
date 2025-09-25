@@ -1,4 +1,4 @@
-# Claude IPC MCP - Let Your AIs Talk to Each Other
+# Claude IPC MCP - Let Your AI Agents Talk to Each Other
 
 ![Version](https://img.shields.io/badge/version-2.0.0-blue)
 ![GitHub stars](https://img.shields.io/github/stars/jdez427/claude-ipc-mcp)
