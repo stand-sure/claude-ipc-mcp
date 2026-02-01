@@ -544,61 +544,92 @@ Size: {size_kb:.1f}KB
             logger.error(f"Failed to save large message: {e}")
             return None
     
-    def _validate_session(self, request: Dict[str, Any], action: str) -> Optional[str]:
-        """Validate session token and return instance_id if valid"""
+    def _validate_session(self, request: Dict[str, Any], action: str) -> Tuple[Optional[str], Optional[str]]:
+        """Validate session token and return (instance_id, error_code) tuple
+
+        Returns:
+            (instance_id, None) if valid
+            (None, error_code) if invalid, where error_code is one of:
+                - "missing_token": No session_token in request
+                - "invalid_token": Token not found in database
+                - "token_expired": Token exists but expired (re-register to recover)
+                - "database_error": Database connection issue
+        """
         if action == "register":
             # Registration doesn't need session token
-            return None
-            
+            return None, None
+
         session_token = request.get("session_token")
         if not session_token:
-            return None
-            
+            return None, "missing_token"
+
         # Hash the provided token to compare with database
         token_hash = self._hash_token(session_token)
-        
+
         # Check database for valid session
         if not self.db_path:
-            return None
-            
+            return None, "database_error"
+
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
-            # Check if token exists and is not expired
+
+            # First check if token exists at all (expired or not)
             cursor.execute('''
-                SELECT instance_id 
-                FROM sessions 
-                WHERE session_token_hash = ? AND expires_at > ?
-            ''', (token_hash, datetime.now().isoformat()))
-            
+                SELECT instance_id, expires_at
+                FROM sessions
+                WHERE session_token_hash = ?
+            ''', (token_hash,))
+
             result = cursor.fetchone()
             conn.close()
-            
-            if result:
-                return result[0]  # Return instance_id
-            return None
-            
+
+            if not result:
+                # Token doesn't exist in database
+                return None, "invalid_token"
+
+            instance_id, expires_at = result
+
+            # Check if token is expired
+            if datetime.fromisoformat(expires_at) <= datetime.now():
+                # Token expired - agent should re-register to recover mailbox
+                return None, "token_expired"
+
+            # Valid token
+            return instance_id, None
+
         except Exception as e:
             logger.error(f"Session validation error: {e}")
-            return None
+            return None, "database_error"
                 
     def _process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Process a broker request"""
         action = request.get("action")
-        
+
         with self.lock:
             # Validate session for non-registration actions
             if action != "register":
-                instance_id = self._validate_session(request, action)
+                instance_id, error_code = self._validate_session(request, action)
                 if not instance_id:
-                    return {"status": "error", "message": "Invalid or missing session token"}
+                    # Return specific error with code for better client handling
+                    error_messages = {
+                        "missing_token": "Session token is missing. Please register first.",
+                        "invalid_token": "Session token is invalid. Please register again.",
+                        "token_expired": "Session expired. Re-register with the same instance_id to recover your mailbox.",
+                        "database_error": "Database error during session validation. Please try again."
+                    }
+                    return {
+                        "status": "error",
+                        "error_code": error_code,
+                        "message": error_messages.get(error_code, "Invalid or missing session token"),
+                        "recoverable": error_code in ["missing_token", "token_expired"]  # Client can auto-recover
+                    }
                 # Override any claimed instance_id with the validated one
                 if "from_id" in request:
                     request["from_id"] = instance_id
                 if "instance_id" in request:
                     request["instance_id"] = instance_id
-                    
+
                 # Check rate limit for authenticated requests
                 if not self.rate_limiter.is_allowed(instance_id):
                     return {"status": "error", "message": "Rate limit exceeded. Please wait before sending more requests."}
