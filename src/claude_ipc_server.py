@@ -30,6 +30,7 @@ from mcp.types import (
 # Configuration
 IPC_HOST = "127.0.0.1"  # Localhost works across WSL instances
 IPC_PORT = 9876  # Choose a port that's likely free
+ONLINE_CUTOFF_SECONDS = 300  # 5 minutes — shared threshold for online/offline status
 HEARTBEAT_INTERVAL = 30  # seconds
 
 # Set up logging
@@ -734,7 +735,11 @@ Size: {size_kb:.1f}KB
                 # Save to SQLite
                 self._save_message_to_db(from_id, resolved_to, msg_data)
                 
-                recipient_online = resolved_to in self.instances
+                if resolved_to in self.instances:
+                    age = (datetime.now() - self.instances[resolved_to]).total_seconds()
+                    recipient_online = age < ONLINE_CUTOFF_SECONDS
+                else:
+                    recipient_online = False
                 base_response = {
                     "status": "ok",
                     "delivered_to": resolved_to,
@@ -883,7 +888,7 @@ Size: {size_kb:.1f}KB
                 if resolved_id in self.instances:
                     last_seen = self.instances[resolved_id]
                     age_seconds = (datetime.now() - last_seen).total_seconds()
-                    online = age_seconds < 300  # 5 minutes
+                    online = age_seconds < ONLINE_CUTOFF_SECONDS
                     return {
                         "status": "ok",
                         "target": resolved_id,
@@ -1293,9 +1298,9 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         timeout_ms = min(arguments.get("timeout_ms", 30000), 120000)
         timeout_s = timeout_ms / 1000.0
         poll_interval = 1.0  # seconds
-        elapsed = 0.0
+        deadline = time.monotonic() + timeout_s
 
-        while elapsed < timeout_s:
+        while time.monotonic() < deadline:
             response = BrokerClient.send_request({
                 "action": "check",
                 "instance_id": instance_id,
@@ -1313,7 +1318,6 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
                 return [TextContent(type="text", text=formatted)]
 
             await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
 
         return [TextContent(type="text", text=f"No messages received (timeout after {timeout_s:.0f}s)")]
 
