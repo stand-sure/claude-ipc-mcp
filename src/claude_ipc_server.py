@@ -734,12 +734,20 @@ Size: {size_kb:.1f}KB
                 # Save to SQLite
                 self._save_message_to_db(from_id, resolved_to, msg_data)
                 
+                recipient_online = resolved_to in self.instances
+                base_response = {
+                    "status": "ok",
+                    "delivered_to": resolved_to,
+                    "recipient_online": recipient_online,
+                    "forwarded": forwarded,
+                }
                 if forwarded:
-                    return {"status": "ok", "message": f"Message forwarded from {to_id} to {resolved_to}"}
+                    base_response["message"] = f"Message forwarded from {to_id} to {resolved_to}"
                 elif future_delivery:
-                    return {"status": "ok", "message": f"Message queued for {resolved_to} (not yet registered)"}
+                    base_response["message"] = f"Message queued for {resolved_to} (not yet registered)"
                 else:
-                    return {"status": "ok", "message": "Message sent"}
+                    base_response["message"] = "Message sent"
+                return base_response
                 
             elif action == "broadcast":
                 from_id = request["from_id"]
@@ -865,7 +873,33 @@ Size: {size_kb:.1f}KB
                         self.queues[instance_id].append(notification)
                 
                 return {"status": "ok", "message": f"Renamed {old_id} to {new_id}"}
-                
+
+            elif action == "ping":
+                target_id = request.get("target_id", "")
+                if not self._validate_instance_id(target_id):
+                    return {"status": "error", "message": "Invalid target ID format"}
+
+                resolved_id = self._resolve_name(target_id)
+                if resolved_id in self.instances:
+                    last_seen = self.instances[resolved_id]
+                    age_seconds = (datetime.now() - last_seen).total_seconds()
+                    online = age_seconds < 300  # 5 minutes
+                    return {
+                        "status": "ok",
+                        "target": resolved_id,
+                        "online": online,
+                        "last_seen": last_seen.isoformat(),
+                        "age_seconds": int(age_seconds),
+                    }
+                else:
+                    return {
+                        "status": "ok",
+                        "target": resolved_id,
+                        "online": False,
+                        "last_seen": None,
+                        "age_seconds": None,
+                    }
+
             else:
                 return {"status": "error", "message": f"Unknown action: {action}"}
 
@@ -1092,6 +1126,39 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="ping",
+            description="Check if another instance is online without sending a message",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "target_id": {
+                        "type": "string",
+                        "description": "The instance ID to check"
+                    }
+                },
+                "required": ["target_id"]
+            }
+        ),
+        Tool(
+            name="receive",
+            description="Block-wait for a message with timeout (eliminates polling loops)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instance_id": {
+                        "type": "string",
+                        "description": "Your instance ID"
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Max wait time in milliseconds (default 30000, max 120000)",
+                        "default": 30000
+                    }
+                },
+                "required": ["instance_id"]
+            }
+        ),
+        Tool(
             name="auto_process",
             description="Automatically check and process IPC messages (for use with auto-check feature)",
             inputSchema={
@@ -1191,9 +1258,65 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return [TextContent(type="text", text="No new messages")]
             
     elif name == "list_instances":
-        response = BrokerClient.send_request({"action": "list"})
+        if not current_session_token:
+            return [TextContent(type="text", text="Error: Not registered. Please register first.")]
+        response = BrokerClient.send_request({
+            "action": "list",
+            "session_token": current_session_token
+        })
         return [TextContent(type="text", text=json.dumps(response, indent=2))]
-        
+
+    elif name == "ping":
+        if not current_session_token:
+            return [TextContent(type="text", text="Error: Not registered. Please register first.")]
+        response = BrokerClient.send_request({
+            "action": "ping",
+            "target_id": arguments["target_id"],
+            "session_token": current_session_token
+        })
+        if response.get("status") == "ok":
+            target = response.get("target", arguments["target_id"])
+            if response.get("online"):
+                age = response.get("age_seconds", 0)
+                return [TextContent(type="text", text=f"{target} is ONLINE (last seen {age}s ago)")]
+            elif response.get("last_seen"):
+                return [TextContent(type="text", text=f"{target} is OFFLINE (last seen {response['last_seen']})")]
+            else:
+                return [TextContent(type="text", text=f"{target} has never been registered")]
+        return [TextContent(type="text", text=json.dumps(response, indent=2))]
+
+    elif name == "receive":
+        if not current_session_token:
+            return [TextContent(type="text", text="Error: Not registered. Please register first.")]
+
+        instance_id = arguments["instance_id"]
+        timeout_ms = min(arguments.get("timeout_ms", 30000), 120000)
+        timeout_s = timeout_ms / 1000.0
+        poll_interval = 1.0  # seconds
+        elapsed = 0.0
+
+        while elapsed < timeout_s:
+            response = BrokerClient.send_request({
+                "action": "check",
+                "instance_id": instance_id,
+                "session_token": current_session_token
+            })
+
+            if response.get("status") == "ok" and response.get("messages"):
+                formatted = "New messages:\n"
+                for msg in response["messages"]:
+                    formatted += f"\nFrom: {msg['from']}\n"
+                    formatted += f"Time: {msg['timestamp']}\n"
+                    formatted += f"Content: {msg['message']['content']}\n"
+                    if msg['message'].get('data'):
+                        formatted += f"Data: {json.dumps(msg['message']['data'], indent=2)}\n"
+                return [TextContent(type="text", text=formatted)]
+
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        return [TextContent(type="text", text=f"No messages received (timeout after {timeout_s:.0f}s)")]
+
     elif name == "share_file":
         if not current_session_token:
             return [TextContent(type="text", text="Error: Not registered. Please register first.")]
